@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  >
+
+  <title>충격 감지 GPS 전송</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 600px;
+      margin: 0 auto;
+      padding: 24px;
+      line-height: 1.6;
+    }
+
+    h2 {
+      margin-bottom: 8px;
+    }
+
+    .card {
+      border: 1px solid #cccccc;
+      border-radius: 12px;
+      padding: 16px;
+      margin-top: 16px;
+    }
+
+    button {
+      width: 100%;
+      padding: 14px;
+      margin-top: 12px;
+      font-size: 16px;
+      cursor: pointer;
+    }
+
+    .value {
+      font-weight: bold;
+      word-break: break-all;
+    }
+
+    #log {
+      white-space: pre-wrap;
+      background: #f5f5f5;
+      padding: 12px;
+      border-radius: 8px;
+      max-height: 280px;
+      overflow-y: auto;
+      font-size: 13px;
+    }
+  </style>
+</head>
+
+<body>
+
+  <h2>충격 감지 GPS 전송</h2>
+
+  <p>
+    아두이노의 충격 데이터를 확인하고 새로운 충격이 발생하면
+    핸드폰 GPS 위치를 oneM2M 플랫폼에 전송합니다.
+  </p>
+
+  <button id="startButton">
+    GPS 권한 허용 및 감시 시작
+  </button>
+
+  <button id="stopButton" disabled>
+    감시 중지
+  </button>
+
+  <div class="card">
+    <div>
+      상태:
+      <span id="status" class="value">
+        시작 버튼을 눌러 주세요.
+      </span>
+    </div>
+
+    <div>
+      최신 충격값:
+      <span id="impactValue" class="value">
+        없음
+      </span>
+    </div>
+
+    <div>
+      최신 충격 생성 시간:
+      <span id="impactTime" class="value">
+        없음
+      </span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div>
+      위도:
+      <span id="latitude" class="value">
+        없음
+      </span>
+    </div>
+
+    <div>
+      경도:
+      <span id="longitude" class="value">
+        없음
+      </span>
+    </div>
+
+    <div>
+      위치 정확도:
+      <span id="accuracy" class="value">
+        없음
+      </span>
+    </div>
+  </div>
+
+  <div class="card">
+    <strong>실행 기록</strong>
+    <div id="log"></div>
+  </div>
+
+  <script>
+    // =========================================
+    // oneM2M 플랫폼 설정
+    // =========================================
+
+    const API_HOST = "onem2m.iotcoss.ac.kr";
+    const HTTPS_PORT = 443;
+
+    const API_KEY =
+      "dm3S14TESWERPQ7dRjqObJM1fhhehnbE";
+
+    const ORIGIN = "sju23011956";
+    const LECTURE = "LCT_20260002";
+    const CREATOR = "sju23011956";
+
+    /*
+      아래 값은 Platform.ino에 정의된 값과
+      반드시 똑같이 맞춰야 합니다.
+    */
+
+    const CSEBASE = "Mobius";
+
+    // 예: "R4_sju23011956"
+    const R4_AE = "네_AE_이름";
+
+    const IMPACT_CNT = "IMP";
+    const GPS_CNT = "GPS";
+
+
+    // =========================================
+    // URL 생성
+    // =========================================
+
+    const BASE_URL =
+      `https://${API_HOST}:${HTTPS_PORT}`;
+
+    const IMPACT_LATEST_URL =
+      `${BASE_URL}/${CSEBASE}/${R4_AE}/${IMPACT_CNT}/latest`;
+
+    const GPS_UPLOAD_URL =
+      `${BASE_URL}/${CSEBASE}/${R4_AE}/${GPS_CNT}`;
+
+
+    // =========================================
+    // 상태 변수
+    // =========================================
+
+    let monitoringTimer = null;
+
+    // 마지막으로 확인한 충격 CIN의 리소스 ID
+    let lastImpactRi = null;
+
+    // 같은 충격을 중복 처리하지 않도록 사용
+    let processingImpact = false;
+
+    let gpsPermissionReady = false;
+
+
+    // =========================================
+    // 화면 요소
+    // =========================================
+
+    const startButton =
+      document.getElementById("startButton");
+
+    const stopButton =
+      document.getElementById("stopButton");
+
+    const statusElement =
+      document.getElementById("status");
+
+    const impactValueElement =
+      document.getElementById("impactValue");
+
+    const impactTimeElement =
+      document.getElementById("impactTime");
+
+    const latitudeElement =
+      document.getElementById("latitude");
+
+    const longitudeElement =
+      document.getElementById("longitude");
+
+    const accuracyElement =
+      document.getElementById("accuracy");
+
+    const logElement =
+      document.getElementById("log");
+
+
+    // =========================================
+    // 로그 출력
+    // =========================================
+
+    function addLog(message) {
+      const time =
+        new Date().toLocaleTimeString();
+
+      logElement.textContent +=
+        `[${time}] ${message}\n`;
+
+      logElement.scrollTop =
+        logElement.scrollHeight;
+
+      console.log(message);
+    }
+
+
+    function setStatus(message) {
+      statusElement.textContent = message;
+      addLog(message);
+    }
+
+
+    // =========================================
+    // oneM2M 공통 헤더
+    // =========================================
+
+    function createCommonHeaders() {
+      return {
+        "X-M2M-Origin": ORIGIN,
+
+        "X-M2M-RI":
+          `${CREATOR}-${Date.now()}`,
+
+        "X-M2M-RVI": "3",
+
+        /*
+          네 Platform.ino에서 API_KEY를 넣는
+          헤더 이름과 다르면 이 부분을 변경해야 합니다.
+        */
+        "X-M2M-KEY": API_KEY,
+
+        /*
+          수업 플랫폼에서 별도로 요구하는 경우 사용합니다.
+          서버가 요구하지 않는다면 있어도 무시될 수 있습니다.
+        */
+        "X-Lecture-ID": LECTURE
+      };
+    }
+
+
+    // =========================================
+    // 핸드폰 GPS 읽기
+    // =========================================
+
+    function getCurrentLocation() {
+      return new Promise((resolve, reject) => {
+        if (!navigator.geolocation) {
+          reject(
+            new Error(
+              "이 브라우저는 위치 기능을 지원하지 않습니다."
+            )
+          );
+          return;
+        }
+
+        navigator.geolocation.getCurrentPosition(
+          position => {
+            const location = {
+              latitude:
+                position.coords.latitude,
+
+              longitude:
+                position.coords.longitude,
+
+              accuracy:
+                position.coords.accuracy,
+
+              locationTime:
+                new Date(
+                  position.timestamp
+                ).toISOString()
+            };
+
+            resolve(location);
+          },
+
+          error => {
+            let message =
+              "위치 정보를 가져오지 못했습니다.";
+
+            if (error.code === 1) {
+              message =
+                "위치 권한이 거부되었습니다.";
+            } else if (error.code === 2) {
+              message =
+                "현재 위치를 확인할 수 없습니다.";
+            } else if (error.code === 3) {
+              message =
+                "위치 확인 시간이 초과되었습니다.";
+            }
+
+            reject(new Error(message));
+          },
+
+          {
+            enableHighAccuracy: true,
+            timeout: 15000,
+            maximumAge: 0
+          }
+        );
+      });
+    }
+
+
+    // =========================================
+    // 플랫폼의 최신 충격 데이터 확인
+    // =========================================
+
+    async function checkLatestImpact() {
+      if (processingImpact) {
+        return;
+      }
+
+      try {
+        const headers =
+          createCommonHeaders();
+
+        headers["Accept"] =
+          "application/json";
+
+        const response =
+          await fetch(
+            IMPACT_LATEST_URL,
+            {
+              method: "GET",
+              headers: headers,
+              cache: "no-store"
+            }
+          );
+
+        if (!response.ok) {
+          throw new Error(
+            `충격 데이터 조회 실패: HTTP ${response.status}`
+          );
+        }
+
+        const data =
+          await response.json();
+
+        const cin =
+          data["m2m:cin"];
+
+        if (!cin) {
+          throw new Error(
+            "응답에 m2m:cin 데이터가 없습니다."
+          );
+        }
+
+        // Arduino의 content:
+        // String content = String(impactValue, 3);
+        const impactValue =
+          cin["con"];
+
+        // CIN마다 고유한 리소스 ID
+        const impactRi =
+          cin["ri"];
+
+        // CIN 생성 시간
+        const impactCt =
+          cin["ct"];
+
+        impactValueElement.textContent =
+          impactValue ?? "없음";
+
+        impactTimeElement.textContent =
+          impactCt ?? "없음";
+
+
+        /*
+          웹페이지를 처음 실행했을 때는
+          기존에 있던 과거 충격을 전송하지 않고
+          최신 ri만 기준값으로 저장합니다.
+        */
+        if (lastImpactRi === null) {
+          lastImpactRi = impactRi;
+
+          addLog(
+            `초기 충격 데이터 확인: ${impactValue}`
+          );
+
+          addLog(
+            "기존 데이터는 무시하고 새로운 충격을 기다립니다."
+          );
+
+          return;
+        }
+
+
+        /*
+          충격값 자체가 아니라 ri를 비교합니다.
+
+          충격값이 똑같아도 새로운 CIN이면
+          ri가 달라지므로 새로운 사고로 인식합니다.
+        */
+        if (impactRi !== lastImpactRi) {
+          processingImpact = true;
+
+          /*
+            먼저 ri를 바꿔 두어 같은 충격이
+            반복 처리되는 것을 방지합니다.
+          */
+          lastImpactRi = impactRi;
+
+          setStatus(
+            `새로운 충격 감지: ${impactValue}`
+          );
+
+          try {
+            await handleNewImpact(
+              impactValue,
+              impactRi,
+              impactCt
+            );
+          } finally {
+            processingImpact = false;
+          }
+        }
+
+      } catch (error) {
+        setStatus(error.message);
+      }
+    }
+
+
+    // =========================================
+    // 새로운 충격 발생 처리
+    // =========================================
+
+    async function handleNewImpact(
+      impactValue,
+      impactRi,
+      impactTime
+    ) {
+      if (!gpsPermissionReady) {
+        throw new Error(
+          "GPS 사용 준비가 되지 않았습니다."
+        );
+      }
+
+      setStatus(
+        "충격 감지 완료, 핸드폰 위치 확인 중..."
+      );
+
+      try {
+        const location =
+          await getCurrentLocation();
+
+        latitudeElement.textContent =
+          location.latitude.toFixed(7);
+
+        longitudeElement.textContent =
+          location.longitude.toFixed(7);
+
+        accuracyElement.textContent =
+          `${location.accuracy.toFixed(1)} m`;
+
+        setStatus(
+          "위치 확인 완료, 플랫폼 전송 중..."
+        );
+
+        await sendLocationToPlatform(
+          impactValue,
+          impactRi,
+          impactTime,
+          location
+        );
+
+        setStatus(
+          "충격 발생 위치 전송 완료"
+        );
+
+      } catch (error) {
+        setStatus(
+          `GPS 처리 실패: ${error.message}`
+        );
+      }
+    }
+
+
+    // =========================================
+    // GPS 데이터를 플랫폼에 전송
+    // =========================================
+
+    async function sendLocationToPlatform(
+      impactValue,
+      impactRi,
+      impactTime,
+      location
+    ) {
+      /*
+        GPS 컨테이너의 con 안에 저장할 내용입니다.
+
+        IMP에 저장된 충격값과 GPS 위치를
+        하나의 JSON 문자열로 묶어서 전송합니다.
+      */
+
+      const gpsContent = JSON.stringify({
+        impact:
+          Number(impactValue),
+
+        impactRi:
+          impactRi,
+
+        impactTime:
+          impactTime,
+
+        latitude:
+          location.latitude,
+
+        longitude:
+          location.longitude,
+
+        accuracy:
+          location.accuracy,
+
+        gpsTime:
+          location.locationTime,
+
+        sender:
+          "phone-web"
+      });
+
+
+      const requestBody = {
+        "m2m:cin": {
+          "con": gpsContent
+        }
+      };
+
+
+      const headers =
+        createCommonHeaders();
+
+      headers["Content-Type"] =
+        "application/json;ty=4";
+
+      headers["Accept"] =
+        "application/json";
+
+
+      const response =
+        await fetch(
+          GPS_UPLOAD_URL,
+          {
+            method: "POST",
+            headers: headers,
+            body: JSON.stringify(
+              requestBody
+            )
+          }
+        );
+
+
+      if (
+        response.status !== 200 &&
+        response.status !== 201
+      ) {
+        const responseText =
+          await response.text();
+
+        throw new Error(
+          `GPS 업로드 실패: HTTP ${response.status}, ${responseText}`
+        );
+      }
+
+
+      addLog(
+        `GPS 업로드 성공: ` +
+        `${location.latitude}, ` +
+        `${location.longitude}`
+      );
+    }
+
+
+    // =========================================
+    // 시작 버튼
+    // =========================================
+
+    startButton.addEventListener(
+      "click",
+      async () => {
+        startButton.disabled = true;
+
+        setStatus(
+          "핸드폰 GPS 권한 확인 중..."
+        );
+
+        try {
+          /*
+            버튼을 누른 직후 위치 권한을 요청합니다.
+
+            모바일 브라우저는 자동 실행 코드에서
+            위치 권한 요청을 막을 수 있기 때문에
+            사용자 버튼을 통해 먼저 허용받습니다.
+          */
+          const location =
+            await getCurrentLocation();
+
+          gpsPermissionReady = true;
+
+          latitudeElement.textContent =
+            location.latitude.toFixed(7);
+
+          longitudeElement.textContent =
+            location.longitude.toFixed(7);
+
+          accuracyElement.textContent =
+            `${location.accuracy.toFixed(1)} m`;
+
+          setStatus(
+            "GPS 준비 완료, 충격 데이터 감시 시작"
+          );
+
+
+          /*
+            첫 조회에서 기존 IMP 데이터의 ri를
+            기준값으로 저장합니다.
+          */
+          await checkLatestImpact();
+
+
+          /*
+            1초마다 새로운 IMP 데이터를 확인합니다.
+          */
+          monitoringTimer =
+            setInterval(
+              checkLatestImpact,
+              1000
+            );
+
+          stopButton.disabled = false;
+
+        } catch (error) {
+          gpsPermissionReady = false;
+
+          startButton.disabled = false;
+
+          setStatus(
+            `시작 실패: ${error.message}`
+          );
+        }
+      }
+    );
+
+
+    // =========================================
+    // 중지 버튼
+    // =========================================
+
+    stopButton.addEventListener(
+      "click",
+      () => {
+        if (monitoringTimer !== null) {
+          clearInterval(
+            monitoringTimer
+          );
+
+          monitoringTimer = null;
+        }
+
+        startButton.disabled = false;
+        stopButton.disabled = true;
+
+        setStatus(
+          "충격 데이터 감시가 중지되었습니다."
+        );
+      }
+    );
+  </script>
+
+</body>
+</html>
