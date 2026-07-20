@@ -143,10 +143,8 @@
       반드시 똑같이 맞춰야 합니다.
     */
 
-    const CSEBASE = "Mobius";
-
-    // 예: "R4_sju23011956"
-    const R4_AE = "네_AE_이름";
+   const CSEBASE = "Mobius";      // 앞의 /는 빼는 것이 좋음
+   const R4_AE = "R4_TUTO_sju23011956";
 
     const IMPACT_CNT = "IMP";
     const GPS_CNT = "GPS";
